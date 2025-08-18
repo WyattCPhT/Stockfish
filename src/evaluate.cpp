@@ -34,8 +34,91 @@
 #include "types.h"
 #include "uci.h"
 #include "nnue/nnue_accumulator.h"
+#include "bitboard.h"
 
 namespace Stockfish {
+
+namespace Eval {
+
+// King Safety evaluation - new classical evaluation component
+template<Color Us>
+Value king_safety(const Position& pos) {
+    constexpr Color Them = ~Us;
+    
+    int kingDanger = 0;
+    
+    Square ksq = pos.square<KING>(Us);
+    File kf = file_of(ksq);
+    Rank kr = rank_of(ksq);
+    
+    // *** KingSafety++ (BEGIN)
+    
+    // 1. Central uncastled king (files C-F on back rank) while opponent has a queen: +110
+    Rank backRank = (Us == WHITE) ? RANK_1 : RANK_8;
+    if (kr == backRank && kf >= FILE_C && kf <= FILE_F && pos.count<QUEEN>(Them) > 0) {
+        // Check if king has castled (if king is on original square and can't castle, it's uncastled)
+        Square originalKingSquare = (Us == WHITE) ? SQ_E1 : SQ_E8;
+        if (ksq == originalKingSquare && 
+            !pos.can_castle((Us == WHITE) ? WHITE_OO : BLACK_OO) &&
+            !pos.can_castle((Us == WHITE) ? WHITE_OOO : BLACK_OOO)) {
+            kingDanger += 110;
+        }
+    }
+    
+    // 2. Missing friendly pawns on king file and adjacent files (each missing file: +28)
+    File kingFile = file_of(ksq);
+    for (int fileOffset = -1; fileOffset <= 1; fileOffset++) {
+        File checkFile = File(kingFile + fileOffset);
+        if (checkFile >= FILE_A && checkFile <= FILE_H) {
+            Bitboard filePawns = pos.pieces(Us, PAWN) & file_bb(checkFile);
+            if (!filePawns) {
+                kingDanger += 28;
+            }
+        }
+    }
+    
+    // 3. Major piece (rook/queen) direct attacks on king ring squares: +22 per attack square
+    Bitboard kingRing = attacks_bb<KING>(ksq);
+    Bitboard majorPieces = pos.pieces(Them, ROOK, QUEEN);
+    while (majorPieces) {
+        Square sq = pop_lsb(majorPieces);
+        Bitboard attacks;
+        if (type_of(pos.piece_on(sq)) == ROOK) {
+            attacks = attacks_bb<ROOK>(sq, pos.pieces());
+        } else {
+            attacks = attacks_bb<QUEEN>(sq, pos.pieces());
+        }
+        kingDanger += 22 * popcount(attacks & kingRing);
+    }
+    
+    // 4. Early/midgame central exposure (king on files D/E on initial rank after 1/3 of midgame phase passed): +70
+    int totalMaterial = pos.non_pawn_material();
+    int midgameThreshold = (4 * RookValue + 2 * QueenValue) / 3;  // 1/3 of typical midgame material
+    if (totalMaterial > midgameThreshold) {
+        if (kr == backRank && (kf == FILE_D || kf == FILE_E)) {
+            kingDanger += 70;
+        }
+    }
+    
+    // 5. Multi-attacker escalation: if kingAttackersCount[Them] >= 3, add 40 + 10 * (count - 3)
+    int attackerCount = 0;
+    Bitboard attackers = pos.attackers_to(ksq) & pos.pieces(Them);
+    attackerCount = popcount(attackers);
+    
+    if (attackerCount >= 3) {
+        kingDanger += 40 + 10 * (attackerCount - 3);
+    }
+    
+    // *** KingSafety++ (END)
+    
+    // Apply non-linear scaling similar to classical king safety
+    // Using a simple quadratic scaling
+    Value safetyCost = Value(kingDanger * kingDanger / 64);
+    
+    return -safetyCost;  // Negative because danger reduces our evaluation
+}
+
+}
 
 // Returns a static, purely materialistic evaluation of the position from
 // the point of view of the side to move. It can be divided by PawnValue to get
@@ -79,6 +162,12 @@ Value Eval::evaluate(const Eval::NNUE::Networks&    networks,
 
     int material = 535 * pos.count<PAWN>() + pos.non_pawn_material();
     int v        = (nnue * (77777 + material) + optimism * (7777 + material)) / 77777;
+
+    // Add king safety evaluation (hybrid with NNUE)
+    Value kingSafety = pos.side_to_move() == WHITE ? 
+                      king_safety<WHITE>(pos) + king_safety<BLACK>(pos) :
+                      king_safety<BLACK>(pos) + king_safety<WHITE>(pos);
+    v += kingSafety;
 
     // Damp down the evaluation linearly when shuffling
     v -= v * pos.rule50_count() / 212;
