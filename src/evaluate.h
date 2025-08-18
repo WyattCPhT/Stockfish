@@ -44,6 +44,10 @@ class AccumulatorStack;
 
 std::string trace(Position& pos, const Eval::NNUE::Networks& networks);
 
+// King Safety evaluation functions
+template<Color Us>
+Value king_safety(const Position& pos);
+
 int   simple_eval(const Position& pos);
 bool  use_smallnet(const Position& pos);
 Value evaluate(const NNUE::Networks&          networks,
